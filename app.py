@@ -1,12 +1,13 @@
+import os
+from io import BytesIO
+import re
+import time
 # from deep_translator import GoogleTranslator
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 import streamlit.components.v1 as components
 import streamlit as st
 from lxml import etree
-import os
-from io import BytesIO
-import re
 import pandas as pd
 import openpyxl
 # 设置路径
@@ -23,23 +24,54 @@ def get_xsl_file(text):
 # 部署翻译模型
 @ st.cache_resource
 def load_model(model_name):
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to("cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     return model, tokenizer
 
-def nlp_translate(text, model, tokenizer):
-    if not text or not text.strip():
-        return ""
-    tokenized_input = tokenizer(
-        [text],
-        return_tensors = "pt",
-        padding = True,
-        truncation = True,
-        max_length = 512
-         )
 
-    translated_tokens = model.generate(**tokenized_input, max_length=512)
-    return tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+import re
+
+
+def is_all_uppercase(text):
+    # 判断文本是否全大写
+    return text.isupper()
+
+
+def batch_translate(text_list, model, greedy, tokenizer, batch_size=8):
+    translated_texts = []
+    for i in range(0, len(text_list), batch_size):
+        batch = text_list[i:i + batch_size]
+
+        # 过滤掉全大写的单词
+        filtered_batch = [text for text in batch if not is_all_uppercase(text)]
+
+        if filtered_batch:
+            inputs = tokenizer(filtered_batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(
+                "cpu")
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_length=512,
+                    num_beams=1 if greedy else 4,
+                    early_stopping=False
+                )
+            decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            # 将已翻译的文本合并回原批次
+            j = 0
+            for idx, text in enumerate(batch):
+                if is_all_uppercase(text):
+                    # 对全大写文本直接保留原始文本
+                    translated_texts.append(text)
+                else:
+                    translated_texts.append(decoded[j])
+                    j += 1
+        else:
+            # 如果整个批次都被跳过，直接将原文本添加到结果中
+            translated_texts.extend(batch)
+
+    return translated_texts
+
 
 # Streamlit 页面配置
 st.markdown("""
@@ -270,7 +302,7 @@ if uploaded_file:
     #                 st.session_state.translated_dict[key] = GoogleTranslator(source='zh-CN', target='en').translate(node["text"])
     #             except:
     #                 st.warning(f"Failed: {node['text']}")
-    col1, col2 = st.columns([1,1])
+    col1, col2, col3 = st.columns([2,1,2])
     with col1:
         MODEL_MAP = {
             "English -> 中文": "Helsinki-NLP/opus-mt-en-zh",
@@ -283,26 +315,42 @@ if uploaded_file:
         st.success(f"model '{model_name}' loaded successfully")
 
     with col2:
+        greedy = st.checkbox("⚡ Fast Translate (Greedy Search)", value=True)
+
+    with col3:
         if st.button("🌐 Translate"):
-            progress_bar = st.progress(0, text="Translating...")
-            total = len(unique_nodes)
-            success_count = 0
+            texts_to_translate = []
+            key_list = []
 
-            for i, node in enumerate(unique_nodes):
+            for node in unique_nodes:
                 key = (node["tag"], node["text"])
-                try:
-                    if key not in st.session_state.translated_dict or not st.session_state.translated_dict[key].strip():
-                        # translated = GoogleTranslator(source=source_lang,target=target_lang).translate(node["text"])
-                        translated = nlp_translate(node["text"],model, tokenizer)
-                        st.session_state.translated_dict[key] = translated
-                        success_count += 1
-                except Exception as e:
-                    st.warning(f"❌ Failed: {node['text']} → {e}")
-                progress_bar.progress((i + 1) / total, text=f"Translating... ({i + 1}/{total})")
+                if key not in st.session_state.translated_dict or not st.session_state.translated_dict[key].strip():
+                    texts_to_translate.append(node["text"])
+                    key_list.append(key)
 
-            progress_bar.empty()
-            st.success(f"✅ Finished: {success_count}/{total} translated successfully.")
+            total = len(texts_to_translate)
 
+            if texts_to_translate:
+                progress_bar = st.progress(0, text="Translating...")
+                start_time = time.time()
+
+                translated_texts = []
+                for i in range(0, total, 8):  # 批次大小为8
+                    batch = texts_to_translate[i:i + 8]
+                    translated_batch = batch_translate(batch, model, greedy, tokenizer)
+                    translated_texts.extend(translated_batch)
+                    progress_bar.progress(min((i + len(batch)) / total, 1.0),
+                                          text=f"Translating... ({i + len(batch)}/{total})")
+
+                for key, translated in zip(key_list, translated_texts):
+                    st.session_state.translated_dict[key] = translated
+
+                progress_bar.empty()
+                duration = time.time() - start_time
+                st.success(
+                    f"✅ Finished: {total}/{len(unique_nodes)} translated successfully in {duration:.2f} seconds.")
+            else:
+                st.info("✨ All items already translated.")
     # 编辑区域
     for i, node in enumerate(unique_nodes):
         tag, orig_text = node["tag"], node["text"]
