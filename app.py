@@ -273,7 +273,7 @@ if uploaded_file:
     col1, col2 = st.columns([1,1])
     with col1:
         MODEL_MAP = {
-            "English -> 中文": "TencentARC/opus-mt-en-zh-med",
+            "English -> 中文": "Helsinki-NLP/opus-mt-en-zh",
             "中文 -> English": "Helsinki-NLP/opus-mt-zh-en",
         }
         selected_direction = st.selectbox("", list(MODEL_MAP.keys()), label_visibility="collapsed")
