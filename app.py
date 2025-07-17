@@ -37,7 +37,7 @@ def is_all_uppercase(text):
     return text.isupper()
 
 
-def batch_translate(text_list, model, greedy, tokenizer, batch_size=8):
+def batch_translate(text_list, model, num_beams, tokenizer, batch_size=8):
     translated_texts = []
     for i in range(0, len(text_list), batch_size):
         batch = text_list[i:i + batch_size]
@@ -52,7 +52,7 @@ def batch_translate(text_list, model, greedy, tokenizer, batch_size=8):
                 outputs = model.generate(
                     **inputs,
                     max_length=512,
-                    num_beams=1 if greedy else 4,
+                    num_beams=num_beams,
                     early_stopping=False
                 )
             decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -80,6 +80,20 @@ st.markdown("""
             font-size: 28px !important;
             color: #004a99;
         }
+        [data-testid="stSidebarHeader"] {
+          display: none !important;
+        }
+        [data-testid="stSidebar"][aria-expanded="true"]{
+            min-width: 50vw; !important;
+            background-color: #F0F2F6 !important; 
+        }
+        [data-testid="stMain"] > div:first-child {
+            margin-left: 1vw !important;
+            width: 48vw !important;
+        }
+        iframe[data-testid="stIFrame"] {
+            height: 79vh !important;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -91,9 +105,11 @@ if "highlight_text" not in st.session_state:
     st.session_state.highlight_text = ""
 
 with st.sidebar:
-
-    uploaded_file = st.file_uploader("📂 Upload define.xml", type=["xml"])
-    uploaded_excel = st.file_uploader("🧾 Import migrated translation file", type=["xlsx"], key="xlsx_upload")
+    col1, col2=st.columns([1,1])
+    with col1:
+        uploaded_file = st.file_uploader("📂 Upload define.xml", type=["xml"])
+    with col2:
+        uploaded_excel = st.file_uploader("🧾 Import migrated translation file", type=["xlsx"], key="xlsx_upload")
 
     # 按tag, orig_text键匹配
     # if uploaded_excel:
@@ -124,8 +140,8 @@ with st.sidebar:
         root = xml_tree.getroot()
 
         # 根据 StudyName 决定 XSL 样式
-        sample_text = root.xpath("//*[local-name()='ProtocolName']/text()")
-        sample_text = sample_text[0] if sample_text else ""
+        sample_texts = root.xpath(f"//*[local-name()='StudyName']/text()|//*[local-name()='StudyDescription']/text()|//*[local-name()='ProtocolName']/text()")
+        sample_text = "\n".join(t.strip() for t in sample_texts if t.strip())
         xsl_path = os.path.join(base_dir, get_xsl_file(sample_text))
 
         try:
@@ -168,7 +184,7 @@ with st.sidebar:
                 .highlighted {{ background-color: yellow !important; }}
             </style>
             """
-            st.components.v1.html(html_with_js, height=800, scrolling=True)
+            st.components.v1.html(html_with_js, scrolling=True)
         except Exception as e:
             st.error(f"❌ 样式渲染失败：{e}")
 
@@ -192,19 +208,30 @@ if uploaded_file:
         if node.text and node.text.strip():
             nodes.append({"tag": etree.QName(node.tag).localname, "text": node.text.strip()})
 
-    # 2. ItemGroupDef: def:Structure, def:Class
+    # 2. ItemGroupDef: def:Structure, def:Class, Description
     for node in root.xpath("//*[local-name()='ItemGroupDef']"):
+        group_oid = node.get("OID", "").strip()  # 获取 OID 信息
+
+        # 提取 def:Structure 和 def:Class 属性
         for attr in [f"{{{ns['def']}}}Structure", f"{{{ns['def']}}}Class"]:
             val = node.get(attr)
             if val and val.strip():
                 attr_name = attr.split("}")[-1]
-                nodes.append({"tag": f"ItemGroupDef@{attr_name}", "text": val.strip()})
+                nodes.append({
+                    "tag": f"ItemGroupDef@{attr_name}.{group_oid}.",
+                    "text": val.strip()
+                })
 
-        desc_nodes = node.xpath(".//*[local-name()='Description']/*[local-name()='TranslatedText'][not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN']")
-
+        # 提取 Description 下的 TranslatedText
+        desc_nodes = node.xpath(
+            ".//*[local-name()='Description']/*[local-name()='TranslatedText'][not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN']"
+        )
         for tt in desc_nodes:
             if tt.text and tt.text.strip():
-                nodes.append({"tag": "ItemGroupDef.Description", "text": tt.text.strip()})
+                nodes.append({
+                    "tag": f"ItemGroupDef.Description.{group_oid}",
+                    "text": tt.text.strip()
+                })
 
     # 3.ItemDef: Description
     for node in root.xpath("//*[local-name()='ItemDef']"):
@@ -259,9 +286,9 @@ if uploaded_file:
         text = n["text"]
         # 构造用于去重的 display_tag（保留最后一个字段）
         if tag.startswith("ItemGroupDef@"):
-            display_tag = "[Dataset] " + tag.split("@")[1]
+            display_tag = "[Dataset] " + tag.split(".")[-2] + "(" + tag.split(".")[0].split("@")[1] +")"
         elif tag.startswith("ItemGroupDef.Description"):
-            display_tag = "[Dataset] Description"
+            display_tag = "[Dataset] "+ tag.split(".")[-1] + "(Description)"
         elif tag.startswith("IT") and tag.count(".") == 2:
             display_tag = "[Variable] " + tag.split(".")[-1] + "(Label)"
         elif ".Origin" in tag:
@@ -315,8 +342,8 @@ if uploaded_file:
         st.success(f"model '{model_name}' loaded successfully")
 
     with col2:
-        greedy = st.checkbox("⚡ Fast Translate (Greedy Search)", value=True)
-
+        num_beams = st.slider("**Translation Accuracy**", min_value=1, max_value=4, value=1, step=1)
+        st.caption("boost quality but slow speed")
     with col3:
         if st.button("🌐 Translate"):
             texts_to_translate = []
@@ -337,7 +364,7 @@ if uploaded_file:
                 translated_texts = []
                 for i in range(0, total, 8):  # 批次大小为8
                     batch = texts_to_translate[i:i + 8]
-                    translated_batch = batch_translate(batch, model, greedy, tokenizer)
+                    translated_batch = batch_translate(batch, model, num_beams, tokenizer)
                     translated_texts.extend(translated_batch)
                     progress_bar.progress(min((i + len(batch)) / total, 1.0),
                                           text=f"Translating... ({i + len(batch)}/{total})")
@@ -390,18 +417,54 @@ if uploaded_file:
 
         for (tag, orig_text), translated_text in st.session_state.translated_dict.items():
             if tag.startswith("ItemGroupDef@"):
-                tag_name, attr_name = tag.split('@')
+                try:
+                    prefix, rest = tag.split('@')  # prefix 是 "ItemGroupDef"，rest 是 "Structure.IG.ADSL"
+                    attr_name = rest.split('.')[0]  # attr_name 是 "Structure"，oid 是 "IG.ADSL"
+                    oid = rest.split('.')[1] + '.' + rest.split('.')[2]
+                except Exception:
+                    continue  # 无法解析的 tag 跳过
+
                 is_def_attr = attr_name in ["Structure", "Class"]
                 attr_qname = f"{{{ns['def']}}}{attr_name}" if is_def_attr else attr_name
-                xpath_expr = f"//*[local-name()='{tag_name}' and @{('def:' if is_def_attr else '') + attr_name}='{orig_text}']"
-                nodes_with_attr = root.xpath(xpath_expr, namespaces=ns if is_def_attr else None)
-                for elem in nodes_with_attr:
-                    old_val = elem.get(attr_qname)
-                    elem.set(attr_qname, translated_text)
-                    changes.append({"tag": tag, "from": old_val, "to": translated_text})
-                    count_updated += 1
 
-            elif tag.startswith("ItemGroupDef.Description") or (tag.startswith("IT") and tag.count(".") == 2):
+                # 精确定位指定 OID 的 ItemGroupDef 元素
+                xpath_expr = f"//*[local-name()='ItemGroupDef' and @OID='{oid}']"
+                nodes = root.xpath(xpath_expr)
+
+                for elem in nodes:
+                    old_val = elem.get(attr_qname)
+                    if old_val and old_val.strip() == orig_text:
+                        elem.set(attr_qname, translated_text)
+                        changes.append({"tag": tag, "from": old_val, "to": translated_text})
+                        count_updated += 1
+
+            elif tag.startswith("ItemGroupDef.Description."):
+                try:
+                    oid = tag.split('.')[-2] + '.' + tag.split('.')[-1]  # 处理 IG.ADSL 形式
+                except Exception:
+                    continue
+
+                # 精确定位 IG.ADSL 的 Description 下的 TranslatedText
+                desc_nodes = root.xpath(
+                    f"""
+                                    (
+                                        //*[local-name()='ItemDef']//*[local-name()='Description']/*[local-name()='TranslatedText']
+                                        |
+                                        //*[local-name()='ItemGroupDef']//*[local-name()='Description']/*[local-name()='TranslatedText']
+                                        |
+                                        //*[local-name()='CommentDef']//*[local-name()='Description']/*[local-name()='TranslatedText']
+                                    )
+                                    [(not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN') and normalize-space(text())="{orig_text}"]
+                                    """,
+                    namespaces=ns
+                )
+                for tt in desc_nodes:
+                    if (tt.text or "").strip() == orig_text:
+                        tt.text = translated_text
+                        changes.append({"tag": tag, "from": orig_text, "to": translated_text})
+                        count_updated += 1
+
+            elif tag.startswith("IT") and tag.count(".") == 2:
                 desc_nodes = root.xpath(
                     f"""
                     (
@@ -430,34 +493,41 @@ if uploaded_file:
 
             elif ".Origin" in tag:
                 base_oid = tag.rsplit(".Origin", 1)[0]
+
                 origin_nodes = root.xpath(
-                    f"""
-                    //*[local-name()='ItemDef'][@OID='{base_oid}']
-                    /*[local-name()='Origin']
-                    /*[local-name()='Description']
-                    /*[local-name()='TranslatedText']
-                    [ (not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN') and normalize-space(text())="{orig_text}" ]
-                    """,
+                    f"//*[local-name()='ItemDef' or local-name()='ItemGroupDef'][@OID='{base_oid}']/*[local-name()='Origin']",
                     namespaces=ns
                 )
-                for en_node in origin_nodes:
-                    parent = en_node.getparent()
-                    for c in parent.xpath("./*[local-name()='TranslatedText']"):
-                        parent.remove(c)
-                    new_node = etree.Element("TranslatedText")
-                    new_node.set(f"{{{ns['xml']}}}lang", "zh-CN" if tag_lang_is_chinese(translated_text) else "en")
-                    new_node.text = translated_text
-                    parent.append(new_node)
-                    changes.append({"tag": tag, "from": orig_text, "to": translated_text})
-                    count_updated += 1
+
+                for origin_node in origin_nodes:
+                    desc_nodes = origin_node.xpath(".//*[local-name()='Description']/*[local-name()='TranslatedText']")
+                    for en_node in desc_nodes:
+                        if en_node.text and en_node.text.strip() == orig_text.strip():
+                            parent = en_node.getparent()
+                            old_texts = [c.text for c in parent.xpath("./*[local-name()='TranslatedText']")]
+                            for c in parent.xpath("./*[local-name()='TranslatedText']"):
+                                parent.remove(c)
+                            new_node = etree.Element("TranslatedText")
+                            new_node.set(f"{{{ns['xml']}}}lang",
+                                         "zh-CN" if tag_lang_is_chinese(translated_text) else "en")
+                            new_node.text = translated_text
+                            parent.append(new_node)
+
+                            changes.append({"tag": tag, "from": "; ".join(old_texts), "to": translated_text})
+                            count_updated += 1
 
             elif tag.startswith("CommentDef@"):
                 comment_oid = tag.split("@")[1]
+
+                # ✅ 1️⃣ 替换 CommentDef 节点自身的 TranslatedText
                 desc_nodes = root.xpath(
                     f"""
                     //*[local-name()='CommentDef'][@OID='{comment_oid}']
                     /*[local-name()='Description']/*[local-name()='TranslatedText']
-                    [(not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN') and normalize-space(text())="{orig_text}"]
+                    [
+                        (not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN')
+                        and normalize-space(text())="{orig_text}"
+                    ]
                     """,
                     namespaces=ns
                 )
@@ -473,30 +543,66 @@ if uploaded_file:
                     changes.append({"tag": tag, "from": "; ".join(old_texts), "to": translated_text})
                     count_updated += 1
 
-            elif tag.startswith("MT."):
-                desc_nodes = root.xpath(
+                # ✅ 2️⃣ 替换引用此 CommentDef 的节点的 TranslatedText（如 ItemDef、MethodDef 等）
+                referencing_nodes = root.xpath(
                     f"""
-                        //*[local-name()='MethodDef'][@OID='{tag}']
-                        /*[local-name()='Description']/*[local-name()='TranslatedText']
-                        [(not(@xml:lang) or @xml:lang='en' or @xml:lang='zh-CN') and normalize-space(text())="{orig_text}"]
-                        """,
+                    //*[ 
+                        @def:CommentOID='{comment_oid}' 
+                        and (local-name()='ItemDef' or local-name()='ValueListDef' or local-name()='MethodDef')
+                    ]
+                    """,
                     namespaces=ns
                 )
+                for ref_node in referencing_nodes:
+                    desc_nodes = ref_node.xpath(
+                        ".//*[local-name()='Description']/*[local-name()='TranslatedText']",
+                        namespaces=ns
+                    )
+                    for en_node in desc_nodes:
+                        existing_text = en_node.text
+                        if existing_text and " ".join(existing_text.split()) == " ".join(orig_text.split()):
+                            parent = en_node.getparent()
+                            old_texts = [c.text for c in parent.xpath("./*[local-name()='TranslatedText']")]
+                            for c in parent.xpath("./*[local-name()='TranslatedText']"):
+                                parent.remove(c)
+                            new_node = etree.Element("TranslatedText")
+                            new_node.set(f"{{{ns['xml']}}}lang",
+                                         "zh-CN" if tag_lang_is_chinese(translated_text) else "en")
+                            new_node.text = translated_text
+                            parent.append(new_node)
 
-                for en_node in desc_nodes:
-                    parent = en_node.getparent()
-                    if parent is not None:
-                        old_texts = [c.text for c in parent.xpath("./*[local-name()='TranslatedText']")]
-                        parent = en_node.getparent()
-                        old_texts = [c.text for c in parent.xpath("./*[local-name()='TranslatedText']")]
-                        for c in parent.xpath("./*[local-name()='TranslatedText']"):
-                            parent.remove(c)
-                        new_node = etree.Element("TranslatedText")
-                        new_node.set(f"{{{ns['xml']}}}lang", "zh-CN" if tag_lang_is_chinese(translated_text) else "en")
-                        new_node.text = translated_text
-                        parent.append(new_node)
-                        changes.append({"tag": tag, "from": "; ".join(old_texts), "to": translated_text})
-                        count_updated += 1
+                            node_tag = ref_node.tag.split("}")[-1]
+                            node_oid = ref_node.attrib.get("OID", comment_oid)
+                            changes.append({
+                                "tag": f"{node_tag}@{node_oid}",
+                                "from": "; ".join(old_texts),
+                                "to": translated_text
+                            })
+                            count_updated += 1
+
+
+            elif tag.startswith("MT."):
+                method_nodes = root.xpath(f"//*[local-name()='MethodDef'][@OID='{tag}']", namespaces=ns)
+                for method_node in method_nodes:
+                    # 获取 Description/TranslatedText 子节点
+                    desc_nodes = method_node.xpath(
+                        ".//*[local-name()='Description']/*[local-name()='TranslatedText']"
+                    )
+                    for en_node in desc_nodes:
+                        if en_node.text and en_node.text.strip() == orig_text.strip():
+                            parent = en_node.getparent()
+                            old_texts = [c.text for c in parent.xpath("./*[local-name()='TranslatedText']")]
+                            for c in parent.xpath("./*[local-name()='TranslatedText']"):
+                                parent.remove(c)
+                            # 添加新的翻译
+                            new_node = etree.Element("TranslatedText")
+                            new_node.set(f"{{{ns['xml']}}}lang",
+                                         "zh-CN" if tag_lang_is_chinese(translated_text) else "en")
+                            new_node.text = translated_text
+                            parent.append(new_node)
+
+                            changes.append({"tag": tag, "from": "; ".join(old_texts), "to": translated_text})
+                            count_updated += 1
 
             else:
                 matches = root.xpath(f"//*[local-name()='{tag}' and normalize-space(text())='{orig_text}']")
